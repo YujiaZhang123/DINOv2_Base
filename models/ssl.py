@@ -11,15 +11,15 @@ class SSLArch(nn.Module):
     def __init__(
         self,
         img_size=96,
-        patch_size=16,
-        embed_dim=768,
+        patch_size=8,
+        embed_dim=384,
         depth=12,
-        num_heads=12,
+        num_heads=6,
         mlp_ratio=4.0,
-        drop_path_rate=0.1,
+        drop_path_rate=0.0,
         num_prototypes=8192,
         n_global_crops=2,
-        n_local_crops=6,
+        n_local_crops=8,
     ):
         super().__init__()
 
