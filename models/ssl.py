@@ -16,7 +16,7 @@ class SSLArch(nn.Module):
         depth=12,
         num_heads=6,
         mlp_ratio=4.0,
-        drop_path_rate=0.025,
+        drop_path_rate=0.035,
         num_prototypes=8192,
         n_global_crops=2,
         n_local_crops=6,
