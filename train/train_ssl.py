@@ -30,7 +30,7 @@ class TrainingConfig:
     patch_size: int = 8              
 
     # ----- model -----
-    embed_dim: int = 408
+    embed_dim: int = 420
     depth: int = 12
     num_heads: int = 6
     mlp_ratio: float = 4.0
@@ -38,7 +38,7 @@ class TrainingConfig:
 
     # ----- multi-crop -----
     n_global_crops: int = 2
-    n_local_crops: int = 8
+    n_local_crops: int = 6
     global_crops_scale: tuple = (0.4, 1.0)
     local_crops_scale: tuple = (0.05, 0.3)
 
@@ -137,7 +137,7 @@ def build_dataloader(cfg):
         local_crops_scale=cfg.local_crops_scale,
         local_crops_number=cfg.n_local_crops,
         global_crops_size=cfg.img_size,         # 96
-        local_crops_size=cfg.img_size // 3,     # 32
+        local_crops_size=cfg.img_size // 2,     # 48
     )
 
     dataset = SSLDataset(img_paths, augment)
@@ -163,7 +163,7 @@ def build_model(cfg):
         depth=cfg.depth,
         num_heads=cfg.num_heads,
         mlp_ratio=cfg.mlp_ratio,
-        drop_path_rate=0.025,
+        drop_path_rate=0.035,
         num_prototypes=cfg.num_prototypes,
         n_global_crops=cfg.n_global_crops,
         n_local_crops=cfg.n_local_crops,
