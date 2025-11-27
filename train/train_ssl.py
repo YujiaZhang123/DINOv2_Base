@@ -6,9 +6,11 @@ import math
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
 from data.augmentations import DataAugmentationDINO
@@ -30,9 +32,9 @@ class TrainingConfig:
     patch_size: int = 8              
 
     # ----- model -----
-    embed_dim: int = 408
+    embed_dim: int = 768
     depth: int = 12
-    num_heads: int = 6
+    num_heads: int = 12
     mlp_ratio: float = 4.0
     num_prototypes: int = 8192
 
@@ -43,49 +45,91 @@ class TrainingConfig:
     local_crops_scale: tuple = (0.1, 0.3)
 
     # ----- optimization -----
-    batch_size: int = 200             
-    num_workers: int = 20
-    epochs: int = 230
+    batch_size: int = 100
+    num_workers: int = 24
+    epochs: int = 180
     base_lr: float = 2e-4
     min_lr: float = 2e-6
     weight_decay: float = 0.04
-    warmup_epochs: int = 10
+    warmup_epochs: int = 15
 
     momentum_teacher_base: float = 0.995
     momentum_teacher_final: float = 0.9995
 
     teacher_temp_warmup: float = 0.04
     teacher_temp_final: float = 0.07
-    teacher_temp_warmup_epochs: int = 22
+    teacher_temp_warmup_epochs: int = 20
 
     device: str = "cuda"
     output_dir: str = "checkpoints"
 
 
 #################################################################
+# DDP utils
+#################################################################
+def is_distributed():
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank():
+    return dist.get_rank() if is_distributed() else 0
+
+
+def get_world_size():
+    return dist.get_world_size() if is_distributed() else 1
+
+
+def is_main_process():
+    return get_rank() == 0
+
+
+def init_distributed_mode():
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    else:
+        rank = 0
+        world_size = 1
+        local_rank = 0
+
+    distributed = world_size > 1
+
+    if distributed:
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
+        dist.barrier()
+
+    return distributed, rank, world_size, local_rank
+
+
+#################################################################
 # Seed
 #################################################################
-def set_seed(seed=42):
+def set_seed(seed=66, rank=0):
     import random
     import numpy as np
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    random.seed(seed + rank)
+    np.random.seed(seed + rank)
+    torch.manual_seed(seed + rank)
+    torch.cuda.manual_seed_all(seed + rank)
 
 
 #################################################################
 # Load LOCAL DATASET (NO DOWNLOAD)
 #################################################################
-def load_local_dataset(cfg: TrainingConfig):
+def load_local_dataset(cfg: TrainingConfig, rank: int):
 
     data_root = os.path.join(cfg.local_dir, cfg.split)
 
     if not os.path.exists(data_root):
-        raise FileNotFoundError(
-            f"[ERROR] folder not found: {data_root}\n"
-            f"upload files to {cfg.local_dir}/{cfg.split}/"
-        )
+        if rank == 0:
+            raise FileNotFoundError(
+                f"[ERROR] folder not found: {data_root}\n"
+                f"upload files to {cfg.local_dir}/{cfg.split}/"
+            )
+        else:
+            return []
 
     img_paths = []
     for root, _, files in os.walk(data_root):
@@ -93,7 +137,8 @@ def load_local_dataset(cfg: TrainingConfig):
             if f.lower().endswith((".jpg", ".jpeg", ".png")):
                 img_paths.append(os.path.join(root, f))
 
-    print(f"[dataset] find {len(img_paths)} images in {data_root}")
+    if rank == 0:
+        print(f"[dataset] find {len(img_paths)} images in {data_root}")
 
     return img_paths
 
@@ -128,9 +173,9 @@ def teacher_temp_schedule(cfg, global_step, steps_per_epoch):
 #################################################################
 # Build dataloader
 #################################################################
-def build_dataloader(cfg):
+def build_dataloader(cfg, rank: int):
 
-    img_paths = load_local_dataset(cfg)
+    img_paths = load_local_dataset(cfg, rank)
 
     augment = DataAugmentationDINO(
         global_crops_scale=cfg.global_crops_scale,
@@ -144,7 +189,7 @@ def build_dataloader(cfg):
 
     return create_dataloader(
         dataset=dataset,
-        batch_size=cfg.batch_size,
+        batch_size=cfg.batch_size,  
         num_workers=cfg.num_workers,
         shuffle=True,
         drop_last=True,
@@ -163,7 +208,7 @@ def build_model(cfg):
         depth=cfg.depth,
         num_heads=cfg.num_heads,
         mlp_ratio=cfg.mlp_ratio,
-        drop_path_rate=0.03,
+        drop_path_rate=0.08,
         num_prototypes=cfg.num_prototypes,
         n_global_crops=cfg.n_global_crops,
         n_local_crops=cfg.n_local_crops,
@@ -174,17 +219,38 @@ def build_model(cfg):
 # Training
 #################################################################
 def train(cfg: TrainingConfig):
-    set_seed()
-    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
-    os.makedirs(cfg.output_dir, exist_ok=True)
+    # ----- init distributed -----
+    distributed, rank, world_size, local_rank = init_distributed_mode()
+    set_seed(42, rank)
 
-    dataloader = build_dataloader(cfg)
+    device = torch.device(
+        f"cuda:{local_rank}" if torch.cuda.is_available() and cfg.device.startswith("cuda") else "cpu"
+    )
+
+    if is_main_process():
+        os.makedirs(cfg.output_dir, exist_ok=True)
+        print(f"[DDP] distributed={distributed}, world_size={world_size}, rank={rank}, local_rank={local_rank}")
+        print(f"[DDP] device = {device}")
+
+    dataloader = build_dataloader(cfg, rank)
     steps_per_epoch = len(dataloader)
     total_steps = steps_per_epoch * cfg.epochs
 
+    # ----- build model -----
     model = build_model(cfg).to(device)
+
+    # 只把 student 包进 DDP 也可以，这里图简单，直接包整个 SSLArch
+    if distributed:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,
+        )
+
     model.train()
 
+    # ----- optimizer & schedulers -----
     optimizer = AdamW(
         model.parameters(),
         lr=cfg.base_lr,
@@ -208,13 +274,21 @@ def train(cfg: TrainingConfig):
     )
 
     global_step = 0
-    print("==> Start training")
+    if is_main_process():
+        print("==> Start training")
 
     for epoch in range(cfg.epochs):
         epoch_loss = 0.0
-        pbar = tqdm(dataloader, ncols=120, desc=f"Epoch {epoch+1}/{cfg.epochs}")
 
-        for batch in pbar:
+        if distributed and hasattr(dataloader, "sampler") and dataloader.sampler is not None:
+            if hasattr(dataloader.sampler, "set_epoch"):
+                dataloader.sampler.set_epoch(epoch)
+
+        data_iter = dataloader
+        if is_main_process():
+            data_iter = tqdm(dataloader, ncols=120, desc=f"Epoch {epoch+1}/{cfg.epochs}")
+
+        for batch in data_iter:
             global_crops = [x.to(device, non_blocking=True) for x in batch["global_crops"]]
             local_crops = [x.to(device, non_blocking=True) for x in batch["local_crops"]]
 
@@ -235,30 +309,42 @@ def train(cfg: TrainingConfig):
             lr_schedule.step()
 
             with torch.no_grad():
-                model.update_teacher(momentum)
+                if isinstance(model, DDP):
+                    model.module.update_teacher(momentum)
+                else:
+                    model.update_teacher(momentum)
 
-            step_loss = loss.item()
-            epoch_loss += step_loss
+            step_loss = loss.detach()
+            epoch_loss += step_loss.item()
 
-            pbar.set_postfix({
-                "loss": f"{step_loss:.4f}",
-                "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
-                "temp": f"{teacher_temp:.4f}",
-                "m": f"{momentum:.5f}",
-            })
+            if is_main_process():
+                if isinstance(data_iter, tqdm):
+                    data_iter.set_postfix({
+                        "loss": f"{step_loss.item():.4f}",
+                        "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                        "temp": f"{teacher_temp:.4f}",
+                        "m": f"{momentum:.5f}",
+                    })
 
             global_step += 1
 
-        print(f"[epoch {epoch+1}] avg_loss = {epoch_loss/steps_per_epoch:.4f}")
+        if is_main_process():
+            avg_loss = epoch_loss / steps_per_epoch
+            print(f"[epoch {epoch+1}] avg_loss = {avg_loss:.4f}")
 
-        if epoch == 0 or (epoch + 1) % 5 == 0 or (epoch + 1) == cfg.epochs:
-            ckpt = {
-                "epoch": epoch + 1,
-                "student_backbone": model.student_backbone.state_dict(),
-            }
-            ckpt_path = os.path.join(cfg.output_dir, f"epoch_{epoch+1}.pth")
-            torch.save(ckpt, ckpt_path)
-            print(f"[saved] {ckpt_path}")
+            if epoch == 0 or (epoch + 1) % 5 == 0 or (epoch + 1) == cfg.epochs:
+                arch = model.module if isinstance(model, DDP) else model
+                ckpt = {
+                    "epoch": epoch + 1,
+                    "student_backbone": arch.student_backbone.state_dict(),
+                }
+                ckpt_path = os.path.join(cfg.output_dir, f"epoch_{epoch+1}.pth")
+                torch.save(ckpt, ckpt_path)
+                print(f"[saved] {ckpt_path}")
+
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 #################################################################
