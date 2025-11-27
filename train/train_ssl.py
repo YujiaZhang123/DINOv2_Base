@@ -45,10 +45,10 @@ class TrainingConfig:
     local_crops_scale: tuple = (0.1, 0.3)
 
     # ----- optimization -----
-    batch_size: int = 160
+    batch_size: int = 125
     num_workers: int = 16
     epochs: int = 180
-    base_lr: float = 4e-4
+    base_lr: float = 3.7e-4
     min_lr: float = 2e-6
     weight_decay: float = 0.04
     warmup_epochs: int = 15
