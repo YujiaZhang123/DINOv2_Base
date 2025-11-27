@@ -34,10 +34,13 @@ class DINOLoss(nn.Module):
         teacher_logits: [N_total_global_views * B, out_dim]
         """
         batch_center = teacher_logits.mean(dim=0, keepdim=True)
-        self.center = (
-            self.center * self.center_momentum
-            + batch_center * (1.0 - self.center_momentum)
-        )
+
+        # Sync center across GPUs
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(batch_center)
+            batch_center /= torch.distributed.get_world_size()
+
+        self.center = (self.center * self.center_momentum + batch_center * (1.0 - self.center_momentum))
 
     @torch.no_grad()
     def teacher_distribution(self, logits: torch.Tensor):
